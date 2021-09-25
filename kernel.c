@@ -8,6 +8,7 @@
 #include <signal.h>
 #include <ucontext.h>
 #include <sys/ucontext.h>
+#include <stdlib.h>
 
 extern int shell(int argc, char *argv[]);
 
@@ -18,6 +19,14 @@ static void sighnd(int sig, siginfo_t *info, void *ctx) {
 	syscall_do(regs[REG_RAX], regs[REG_RBX],
 			regs[REG_RCX], regs[REG_RDX],
 			regs[REG_RSI], (void *) regs[REG_RDI]);
+    unsigned long rax = 0;
+    __asm__ __volatile__(
+    ""
+    : "=a"(rax)
+    :
+    );
+    regs[REG_RAX] = rax;
+    regs[REG_RIP] += 2;
 }
 
 int main(int argc, char *argv[]) {
