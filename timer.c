@@ -10,10 +10,29 @@
 
 #include "timer.h"
 
+static int get_usec_total(struct timeval *timeval) {
+    return 1000000 * timeval->tv_sec + timeval->tv_usec;
+}
+
 int timer_cnt(void) {
-	// TODO: getitimer
+    struct itimerval timer_val;
+    getitimer(ITIMER_REAL, &timer_val);
+    return   timer_val.it_interval.tv_usec + timer_val.it_interval.tv_sec * 1000000 - timer_val.it_value.tv_usec
+             - timer_val.it_value.tv_sec * 1000000;
 }
 
 void timer_init(int ms, void (*hnd)(void)) {
-	// TODO: setitimer
+    struct sigaction alrm_action = {
+            .sa_handler = hnd
+    };
+    sigaction(SIGALRM, &alrm_action, NULL);
+    struct timeval period = {
+            .tv_sec = ms / 1000,
+            .tv_usec = (ms % 1000) * 1000
+    };
+    struct itimerval itimerval = {
+            .it_value = period,
+            .it_interval = period
+    };
+    setitimer(ITIMER_REAL, &itimerval, NULL);
 }
