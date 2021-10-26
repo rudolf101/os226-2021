@@ -154,8 +154,8 @@ static void bottom(void) {
 		const long sched_time = sched_gettime();
 		while (waitq != NULL && waitq->waketime <= sched_time) {
 		  struct task *t = waitq;
-		  policy_run(t);
 		  waitq = waitq->next;
+		  policy_run(t);
 		}
 		doswitch();
 		irq_enable();
