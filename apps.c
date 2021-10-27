@@ -91,11 +91,12 @@ static void app_burn(void *_ctx) {
 }
 
 static void app_preempt_sleep(void *_ctx) {
-        struct app_ctx *ctx = _ctx;
-        while (1)  {
-                print(ctx, "sleep");
-		sched_sleep(ctx->cnt);
-        }
+	struct app_ctx *ctx = _ctx;
+	int cnt = ctx->cnt % 1000;
+	for (int i = 0; i < cnt; ++i) {
+		print(ctx, "sleep");
+		sched_sleep(ctx->cnt - cnt);
+	}
 }
 
 static int app(int argc, char* argv[]) {
