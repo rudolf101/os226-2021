@@ -386,8 +386,10 @@ static int do_exec(const char *path, char *argv[]) {
 
 	void *rawelf = mmap(NULL, 128 * 1024, PROT_READ, MAP_PRIVATE, fd, 0);
 
-	if (strncmp(rawelf, "\x7f" "ELF" "\x2", 5))
-	  return 1;
+	if (strncmp(rawelf, "\x7f" "ELF" "\x2", 5)) {
+		printf("ELF header mismatch\n");
+		return 1;
+	}
 
 	Elf64_Ehdr eh;
 	read(fd, &eh, sizeof(Elf64_Ehdr));
