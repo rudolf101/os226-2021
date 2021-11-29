@@ -44,7 +44,7 @@ struct vmctx {
 };
 
 struct task {
-	char stack[8192 + 8]; // +8 добавлено чтобы внутри функции ctx_make(...) файла ctx.c после того, как мы положим entry на вершину стека адрес регистра %rsp был кратен 16 (выровнен по 16 байт)
+	char stack[8192];
 	struct vmctx vm;
 
 	union {
