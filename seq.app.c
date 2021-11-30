@@ -4,7 +4,7 @@
 int atoi(const char *str) {
     int v = 0;
     int sign = 1;
-    if (*str == '-') { str++; sign = -1 }
+    if (*str == '-') { str++; sign = -1; }
     for(; *str >= '0' && *str <= '9'; str++) v = 10 * v + *str - '0';
     return v * sign;
 }
