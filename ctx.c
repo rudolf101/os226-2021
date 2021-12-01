@@ -2,8 +2,6 @@
 
 #include "ctx.h"
 
-#define ENDBR64 0xfa1e0ff3
-
 void ctx_make(struct ctx *ctx, void *entry, void *stack, int alignment) {
         memset(ctx, 0, sizeof(*ctx));
 
