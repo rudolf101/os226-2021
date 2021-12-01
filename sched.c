@@ -530,7 +530,7 @@ static void vmctx_copy(struct vmctx *dst, struct vmctx *src) {
 }
 
 static int do_fork(unsigned long sp) {
-	struct task *t = sched_new(forktramp, (void *) sp, 0, 0);
+	struct task *t = sched_new(forktramp, (void *) sp, 0, NONE);
         vmctx_copy(&t->vm, &current->vm);
         policy_run(t);
 }
