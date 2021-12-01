@@ -208,9 +208,7 @@ static void tasktramp(void) {
 	doswitch();
 }
 
-struct task *sched_new(void (*entrypoint)(void *aspace),
-		void *aspace,
-		int priority) {
+struct task *sched_new(void (*entrypoint)(void *), void *aspace, int priority, int alignment) {
 
 	struct task *t = pool_alloc(&taskpool);
 	t->entry = entrypoint;
@@ -218,7 +216,7 @@ struct task *sched_new(void (*entrypoint)(void *aspace),
 	t->priority = priority;
 	t->next = NULL;
 
-	ctx_make(&t->ctx, tasktramp, t->stack + sizeof(t->stack));
+	ctx_make(&t->ctx, tasktramp, t->stack + sizeof(t->stack), alignment);
 
 	return t;
 }
@@ -485,7 +483,7 @@ static int do_exec(const char *path, char *argv[]) {
 
 	struct ctx dummy;
 	struct ctx new;
-	ctx_make(&new, exectramp, (char*)copyargv);
+	ctx_make(&new, exectramp, (char*)copyargv, STANDARD);
 
 	irq_disable();
 	current->main = (void*)ehdr->e_entry;
@@ -504,7 +502,7 @@ static void forktramp(void* arg) {
 
 	struct ctx dummy;
 	struct ctx new;
-	ctx_make(&new, exittramp, arg);
+	ctx_make(&new, exittramp, arg, NONE);
 	ctx_switch(&dummy, &new);
 }
 
@@ -532,7 +530,7 @@ static void vmctx_copy(struct vmctx *dst, struct vmctx *src) {
 }
 
 static int do_fork(unsigned long sp) {
-	struct task *t = sched_new(forktramp, (void*)sp, 0);
+	struct task *t = sched_new(forktramp, (void *) sp, 0, 0);
         vmctx_copy(&t->vm, &current->vm);
         policy_run(t);
 }
@@ -565,7 +563,7 @@ int main(int argc, char *argv[]) {
 	}
 
 	policy_cmp = prio_cmp;
-	struct task *t = sched_new(inittramp, NULL, 0);
+	struct task *t = sched_new(inittramp, NULL, 0, STANDARD);
 	vmctx_make(&t->vm, 4 * PAGE_SIZE);
 	policy_run(t);
 	sched_run();
