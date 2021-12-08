@@ -2,10 +2,11 @@
 
 #include "ctx.h"
 
-void ctx_make(struct ctx *ctx, void *entry, void *stack, int alignment) {
+
+void ctx_make(struct ctx *ctx, void *entry, void *stack) {
         memset(ctx, 0, sizeof(*ctx));
 
-        if(alignment == STANDARD) stack = (void*)(((unsigned long)stack & ~0xf) - 8);
+        if(*(unsigned*) entry == 0xfa1e0ff3 && (unsigned long) stack % 16 == 0) stack -= 8;
         ctx->rsp = (unsigned long) stack;
         ctx->rsp -= 8;
         *(unsigned long *)ctx->rsp = (unsigned long) entry;

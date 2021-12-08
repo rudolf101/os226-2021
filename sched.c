@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <elf.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/fcntl.h>
 
 #include "sched.h"
@@ -117,6 +118,7 @@ struct pipe {
 	unsigned rdclose : 1;
 	unsigned wrclose : 1;
 };
+
 static struct pipe pipearray[4];
 static struct pool pipepool = POOL_INITIALIZER_ARRAY(pipearray);
 
@@ -254,7 +256,9 @@ static void tasktramp(void) {
 	doswitch();
 }
 
-struct task *sched_new(void (*entrypoint)(void *), void *aspace, int priority, int alignment) {
+struct task *sched_new(void (*entrypoint)(void *aspace),
+		void *aspace,
+		int priority) {
 
 	struct task *t = pool_alloc(&taskpool);
 	t->entry = entrypoint;
@@ -262,7 +266,7 @@ struct task *sched_new(void (*entrypoint)(void *), void *aspace, int priority, i
 	t->priority = priority;
 	t->next = NULL;
 
-	ctx_make(&t->ctx, tasktramp, t->stack + sizeof(t->stack), alignment);
+	ctx_make(&t->ctx, tasktramp, t->stack + sizeof(t->stack));
 
 	return t;
 }
@@ -449,17 +453,51 @@ static void exectramp(void) {
 	abort();
 }
 
+struct old_header_cpio {
+	unsigned short c_magic; // 070707
+	unsigned short c_dev;
+	unsigned short c_ino;
+	unsigned short c_mode;
+	unsigned short c_uid;
+	unsigned short c_gid;
+	unsigned short c_nlink;
+	unsigned short c_rdev;
+	unsigned short c_mtime[2];
+	unsigned short c_namesize;
+	unsigned short c_filesize[2];
+};
+
+void *old_header_cpio_get_next(struct old_header_cpio *header) {
+	uint32_t filesize = (((uint32_t) header->c_filesize[0]) << 16) + header->c_filesize[1];
+	return (void *) (header + 1) + header->c_namesize + header->c_namesize % 2 + filesize + filesize % 2;
+}
+
 int sys_exec(const char *path, char **argv) {
 	char elfpath[32];
-	snprintf(elfpath, sizeof(elfpath), "%s.app", path);
 
-	fprintf(stderr, "FIXME: find elf content in `rootfs`\n");
-	abort();
 	void *rawelf = NULL;
 
-	if (strncmp(rawelf, "\x7f" "ELF" "\x2", 5)) {
-		printf("ELF header mismatch\n");
+	strcpy(elfpath, path);
+	strcat(elfpath, ".app");
+
+	for(struct old_header_cpio *header = rootfs;; header = old_header_cpio_get_next(header)) {
+	  if (header->c_magic != 070707) {
+		printf("found non magic cpio \n");
 		return 1;
+	  }
+	  if (strcmp((void *) (header + 1), "TRAILER!!!") == 0) {
+		printf("not found elf in file\n");
+		return 1;
+	  }
+	  if (strncmp((void *) (header + 1), elfpath, header->c_namesize) == 0) {
+		rawelf = (void *) (header + 1) + header->c_namesize + header->c_namesize % 2;
+		break;
+	  }
+	}
+
+	if (strncmp(rawelf, "\x7f" "ELF" "\x2", 5)) {
+	  printf("ELF header mismatch\n");
+	  return 1;
 	}
 
 	// https://linux.die.net/man/5/elf
@@ -533,7 +571,7 @@ int sys_exec(const char *path, char **argv) {
 
 	struct ctx dummy;
 	struct ctx new;
-	ctx_make(&new, exectramp, (char*)copyargv, STANDARD);
+	ctx_make(&new, exectramp, (char*)copyargv);
 
 	irq_disable();
 	current->main = (void*)ehdr->e_entry;
@@ -555,7 +593,7 @@ static void forktramp(void* arg) {
 
 	struct ctx dummy;
 	struct ctx new;
-	ctx_make(&new, exittramp, arg, NONE);
+	ctx_make(&new, exittramp, arg);
 	ctx_switch(&dummy, &new);
 }
 
@@ -583,7 +621,7 @@ static void vmctx_copy(struct vmctx *dst, struct vmctx *src) {
 }
 
 static int do_fork(unsigned long sp) {
-	struct task *t = sched_new(forktramp, (void *) sp, 0, NONE);
+	struct task *t = sched_new(forktramp, (void*)sp, 0);
 	vmctx_copy(&t->vm, &current->vm);
 	for (int i = 0; i < FD_MAX; ++i) {
 		set_fd(t, i, current->fd[i]);
@@ -836,7 +874,7 @@ int main(int argc, char *argv[]) {
 	}
 
 	policy_cmp = prio_cmp;
-	struct task *t = sched_new(inittramp, NULL, 0, STANDARD);
+	struct task *t = sched_new(inittramp, NULL, 0);
 	vmctx_make(&t->vm, 4 * PAGE_SIZE);
 
 	struct file term;
