@@ -18,6 +18,8 @@
 #include "ctx.h"
 #include "syscall.h"
 #include "usyscall.h"
+#include <sys/stat.h>
+#include <sys/types.h>
 
 /* AMD64 Sys V ABI, 3.2.2 The Stack Frame:
    The 128-byte area beyond the location pointed to by %rsp is considered to
@@ -36,6 +38,10 @@
 #define FD_MAX 16
 
 #define offsetof(s, f) ((unsigned long)(&((s*)0)->f))
+
+#define CPIO_MAGIC 0x71c7
+#define CPIO_END "END"
+#define LONG_BITS (sizeof(unsigned long) * CHAR_BIT)
 
 extern int shell(int argc, char *argv[]);
 
@@ -109,6 +115,20 @@ struct savedctx {
 	unsigned long rip;
 };
 
+struct old_header_cpio {
+  unsigned short c_magic;
+  unsigned short c_dev;
+  unsigned short c_ino;
+  unsigned short c_mode;
+  unsigned short c_uid;
+  unsigned short c_gid;
+  unsigned short c_nlink;
+  unsigned short c_rdev;
+  unsigned short c_mtime[2];
+  unsigned short c_namesize;
+  unsigned short c_filesize[2];
+} __attribute__((__packed__));
+
 struct pipe {
 	char buf[1024];
 	unsigned long rd, wr;
@@ -117,38 +137,53 @@ struct pipe {
 	unsigned rdclose : 1;
 	unsigned wrclose : 1;
 };
-static struct pipe pipearray[4];
-static struct pool pipepool = POOL_INITIALIZER_ARRAY(pipearray);
+
+static int fork_id = -1;
+
+struct shared_memory {
+	int time;
+	struct task tasks[16];
+	struct pipe pipes[4];
+	struct pool task_pool;
+	struct pool pipe_pool;
+	struct task *runq;
+	struct task *waitq;
+	unsigned long bitmap_pages[MEM_PAGES / LONG_BITS];
+	int task_lock;
+	int memfd;
+	void *rootfs;
+	unsigned long rootfs_sz;
+};
+
+static struct shared_memory* sh_mem;
+static int locked = 1;
+static int unlocked = 0;
+
+void acquire(int* lock) {
+  int expected = unlocked;
+  while(__atomic_compare_exchange(lock, &expected, &locked, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED) == false) {
+	expected = unlocked;
+  }
+}
+void release(int* lock) {
+  if(__atomic_compare_exchange(lock, &locked, &unlocked, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED) == false) {
+	fprintf(stderr, "Illegal call of lock release!");
+	exit(-1);
+  }
+}
 
 static void syscallbottom(unsigned long sp);
 static int do_fork(unsigned long sp);
 static void set_fd(struct task *t, int fd, struct file *newf);
 static int pipe_read(int fd, void *buf, unsigned sz);
 
-static int time;
-
 static int current_start;
 static struct task *current;
 static struct task *idle;
-static struct task *runq;
-static struct task *waitq;
-
-static struct task *pendingq;
-static struct task *lastpending;
 
 static int (*policy_cmp)(struct task *t1, struct task *t2);
 
-static struct task taskarray[16];
-static struct pool taskpool = POOL_INITIALIZER_ARRAY(taskarray);
-
 static sigset_t irqs;
-
-static int memfd = -1;
-#define LONG_BITS (sizeof(unsigned long) * CHAR_BIT)
-static unsigned long bitmap_pages[MEM_PAGES / LONG_BITS];
-
-static void *rootfs;
-static unsigned long rootfs_sz;
 
 void irq_disable(void) {
 	sigprocmask(SIG_BLOCK, &irqs, NULL);
@@ -182,10 +217,10 @@ static void bitmap_free(unsigned long *bitmap, size_t size, unsigned v) {
 }
 
 static void policy_run(struct task *t) {
-	struct task **c = &runq;
+	struct task **c = &sh_mem->runq;
 
-	while (*c && (t == idle || policy_cmp(*c, t) <= 0)) {
-		c = &(*c)->next;
+	while (*c && (NULL == (*c)->entry || policy_cmp(*c, t) <= 0)) {
+	  c = &(*c)->next;
 	}
 	t->next = *c;
 	*c = t;
@@ -208,7 +243,7 @@ static void vmctx_make(struct vmctx *vm, size_t stack_size) {
 	vm->stack = USER_PAGES - stack_size / PAGE_SIZE;
 	memset(vm->map, -1, sizeof(vm->map));
 	for (int i = 0; i < stack_size / PAGE_SIZE; ++i) {
-		int mempage = bitmap_alloc(bitmap_pages, sizeof(bitmap_pages));
+	  	int mempage = bitmap_alloc(sh_mem->bitmap_pages, sizeof(sh_mem->bitmap_pages));
 		if (mempage == -1) {
 			abort();
 		}
@@ -226,7 +261,7 @@ static void vmctx_apply(struct vmctx *vm) {
 				PAGE_SIZE,
 				PROT_READ | PROT_WRITE | PROT_EXEC,
 				MAP_SHARED | MAP_FIXED,
-				memfd, vm->map[i] * PAGE_SIZE);
+				sh_mem->memfd, vm->map[i] * PAGE_SIZE);
 		if (addr == MAP_FAILED) {
 			perror("mmap");
 			abort();
@@ -240,7 +275,9 @@ static void vmctx_apply(struct vmctx *vm) {
 
 static void doswitch(void) {
 	struct task *old = current;
-	current = pop_task(&runq);
+	acquire(&sh_mem->task_lock);
+	current = pop_task(&sh_mem->runq);
+	release(&sh_mem->task_lock);
 
 	current_start = sched_gettime();
 	vmctx_apply(&current->vm);
@@ -256,7 +293,7 @@ static void tasktramp(void) {
 
 struct task *sched_new(void (*entrypoint)(void *), void *aspace, int priority, int alignment) {
 
-	struct task *t = pool_alloc(&taskpool);
+	struct task *t = pool_alloc(&sh_mem->task_pool);
 	t->entry = entrypoint;
 	t->as = aspace;
 	t->priority = priority;
@@ -282,7 +319,7 @@ void sched_sleep(unsigned ms) {
 	int curtime;
 	while ((curtime = sched_gettime()) < current->waketime) {
 		irq_disable();
-		struct task **c = &waitq;
+		struct task **c = &sh_mem->waitq;
 		while (*c && (*c)->waketime < current->waketime) {
 			c = &(*c)->next;
 		}
@@ -308,19 +345,25 @@ static void hctx_push(greg_t *regs, unsigned long val) {
 }
 
 static void timerbottom() {
-	time += TICK_PERIOD;
-
-	while (waitq && waitq->waketime <= sched_gettime()) {
-		struct task *t = waitq;
-		waitq = waitq->next;
-		policy_run(t);
+	if(fork_id == 0) {
+	  sh_mem->time += TICK_PERIOD;
 	}
 
+	acquire(&sh_mem->task_lock);
+	while (sh_mem->waitq && sh_mem->waitq->waketime <= sched_gettime()) {
+	  struct task *t = sh_mem->waitq;
+	  sh_mem->waitq = sh_mem->waitq->next;
+	  policy_run(t);
+	}
+	release(&sh_mem->task_lock);
+
 	if (TICK_PERIOD <= sched_gettime() - current_start) {
-		irq_disable();
-		policy_run(current);
-		doswitch();
-		irq_enable();
+	  irq_disable();
+	  acquire(&sh_mem->task_lock);
+	  policy_run(current);
+	  release(&sh_mem->task_lock);
+	  doswitch();
+	  irq_enable();
 	}
 }
 
@@ -356,9 +399,9 @@ static void top(int sig, siginfo_t *info, void *ctx) {
 
 long sched_gettime(void) {
 	int cnt1 = timer_cnt() / 1000;
-	int time1 = time;
+	int time1 = sh_mem->time;
 	int cnt2 = timer_cnt() / 1000;
-	int time2 = time;
+	int time2 = sh_mem->time;
 
 	return (cnt1 <= cnt2) ?
 		time1 + cnt2 :
@@ -370,26 +413,30 @@ void sched_run(void) {
 	sigemptyset(&irqs);
 	sigaddset(&irqs, SIGALRM);
 
-	/*timer_init(TICK_PERIOD, top);*/
+  	fork_id = fork();
+  	timer_init(TICK_PERIOD, top);
+ 	irq_disable();
 
-	irq_disable();
-
-	idle = pool_alloc(&taskpool);
+	acquire(&sh_mem->task_lock);
+	idle = pool_alloc(&sh_mem->task_pool);
+	release(&sh_mem->task_lock);
 	memset(&idle->vm.map, -1, sizeof(idle->vm.map));
 
-	current = idle;
+  	current = idle;
 
 	sigset_t none;
 	sigemptyset(&none);
 
-	while (runq || waitq) {
-		if (runq) {
-			policy_run(current);
-			doswitch();
-		} else {
-			sigsuspend(&none);
-		}
-
+	while (sh_mem->runq || sh_mem->waitq) {
+	  acquire(&sh_mem->task_lock);
+	  if (sh_mem->runq) {
+		policy_run(current);
+		release(&sh_mem->task_lock);
+		doswitch();
+	  } else {
+		release(&sh_mem->task_lock);
+		sigsuspend(&none);
+	  }
 	}
 
 	irq_enable();
@@ -422,10 +469,10 @@ static int vmctx_brk(struct vmctx *vm, void *addr) {
 	}
 
 	for (unsigned i = vm->brk; i < newbrk; ++i) {
-		vm->map[i] = bitmap_alloc(bitmap_pages, sizeof(bitmap_pages));
+		vm->map[i] = bitmap_alloc(sh_mem->bitmap_pages, sizeof(sh_mem->bitmap_pages));
 	}
 	for (unsigned i = newbrk; i < vm->brk; ++i) {
-		bitmap_free(bitmap_pages, sizeof(bitmap_pages), vm->map[i]);
+		bitmap_free(sh_mem->bitmap_pages, sizeof(sh_mem->bitmap_pages), vm->map[i]);
 	}
 	vm->brk = newbrk;
 
@@ -452,15 +499,7 @@ static void exectramp(void) {
 int sys_exec(const char *path, char **argv) {
 	char elfpath[32];
 	snprintf(elfpath, sizeof(elfpath), "%s.app", path);
-
-	fprintf(stderr, "FIXME: find elf content in `rootfs`\n");
-	abort();
-	void *rawelf = NULL;
-
-	if (strncmp(rawelf, "\x7f" "ELF" "\x2", 5)) {
-		printf("ELF header mismatch\n");
-		return 1;
-	}
+  	void *rawelf = NULL;
 
 	// https://linux.die.net/man/5/elf
 	//
@@ -468,30 +507,57 @@ int sys_exec(const char *path, char **argv) {
 	//   Elf64_Phdr -- find one with PT_LOAD, load it for execution
 	//   Find entry point (e_entry)
 
+	void* app_rootfs = sh_mem->rootfs;
+	while(rawelf == NULL) {
+	  struct old_header_cpio hdr = *(struct old_header_cpio*) app_rootfs;
+	  if (hdr.c_magic != CPIO_MAGIC) {
+		fprintf(stderr, "Given file is not .cpio\n");
+		abort();
+	  }
+	  char filename[32];
+	  strncpy(filename, (char *) app_rootfs + sizeof(struct old_header_cpio), sizeof(filename));
+	  unsigned int namesize = hdr.c_namesize + hdr.c_namesize % 2;
+	  unsigned int filesize = (((unsigned int)hdr.c_filesize[0]) << 16) + hdr.c_filesize[1] + hdr.c_filesize[1] % 2;
+	  if(strcmp(filename, CPIO_END) == 0)
+		break;
+	  else if(strcmp(filename, elfpath) != 0) {
+		app_rootfs += sizeof(struct old_header_cpio) + namesize + filesize;
+	  }
+	  else {
+		rawelf = app_rootfs + sizeof(struct old_header_cpio) + namesize;
+		break;
+	  }
+	}
+
+	if (strncmp(rawelf, "\x7f" "ELF" "\x2", 5)) {
+	  printf("ELF header mismatch\n");
+	  return 1;
+	}
+
 	const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *) rawelf;
 	if (!ehdr->e_phoff ||
-			!ehdr->e_phnum ||
-			!ehdr->e_entry ||
-			ehdr->e_phentsize != sizeof(Elf64_Phdr)) {
-		printf("bad ehdr\n");
-		return 1;
+		!ehdr->e_phnum ||
+		!ehdr->e_entry ||
+		ehdr->e_phentsize != sizeof(Elf64_Phdr)) {
+	  printf("bad ehdr\n");
+	  return 1;
 	}
 	const Elf64_Phdr *phdrs = (const Elf64_Phdr *) (rawelf + ehdr->e_phoff);
 
 	void *maxaddr = USER_START;
 	for (int i = 0; i < ehdr->e_phnum; ++i) {
-		const Elf64_Phdr *ph = phdrs + i;
-		if (ph->p_type != PT_LOAD) {
-			continue;
-		}
-		if (ph->p_vaddr < IUSERSPACE_START) {
-			printf("bad section\n");
-			return 1;
-		}
-		void *phend = (void*)(ph->p_vaddr + ph->p_memsz);
-		if (maxaddr < phend) {
-			maxaddr = phend;
-		}
+	  const Elf64_Phdr *ph = phdrs + i;
+	  if (ph->p_type != PT_LOAD) {
+		continue;
+	  }
+	  if (ph->p_vaddr < IUSERSPACE_START) {
+		printf("bad section\n");
+		return 1;
+	  }
+	  void *phend = (void*)(ph->p_vaddr + ph->p_memsz);
+	  if (maxaddr < phend) {
+		maxaddr = phend;
+	  }
 	}
 
 	char **copyargv = USER_START + (USER_PAGES - 1) * PAGE_SIZE;
@@ -499,38 +565,37 @@ int sys_exec(const char *path, char **argv) {
 	char *const *arg = argv;
 	char **copyarg = copyargv;
 	while (*arg) {
-		*copyarg++ = strcpy(copybuf, *arg++);
-		copybuf += strlen(copybuf) + 1;
+	  *copyarg++ = strcpy(copybuf, *arg++);
+	  copybuf += strlen(copybuf) + 1;
 	}
 	*copyarg = NULL;
 
 	if (vmctx_brk(&current->vm, maxaddr)) {
-		printf("vmctx_brk fail\n");
-		return 1;
+	  printf("vmctx_brk fail\n");
+	  return 1;
 	}
 
 	vmctx_apply(&current->vm);
 
 	if (vmprotect(USER_START, maxaddr - USER_START, PROT_READ | PROT_WRITE)) {
-		printf("vmprotect RW failed\n");
-		return 1;
+	  printf("vmprotect RW failed\n");
+	  return 1;
 	}
 
 	for (int i = 0; i < ehdr->e_phnum; ++i) {
-		const Elf64_Phdr *ph = phdrs + i;
-		if (ph->p_type != PT_LOAD) {
-			continue;
-		}
-		memcpy((void*)ph->p_vaddr, rawelf + ph->p_offset, ph->p_filesz);
-		int prot = (ph->p_flags & PF_X ? PROT_EXEC  : 0) |
-			(ph->p_flags & PF_W ? PROT_WRITE : 0) |
-			(ph->p_flags & PF_R ? PROT_READ  : 0);
-		if (vmprotect((void*)ph->p_vaddr, ph->p_memsz, prot)) {
-			printf("vmprotect section failed\n");
-			return 1;
-		}
+	  const Elf64_Phdr *ph = phdrs + i;
+	  if (ph->p_type != PT_LOAD) {
+		continue;
+	  }
+	  memcpy((void*)ph->p_vaddr, rawelf + ph->p_offset, ph->p_filesz);
+	  int prot = (ph->p_flags & PF_X ? PROT_EXEC  : 0) |
+		  (ph->p_flags & PF_W ? PROT_WRITE : 0) |
+		  (ph->p_flags & PF_R ? PROT_READ  : 0);
+	  if (vmprotect((void*)ph->p_vaddr, ph->p_memsz, prot)) {
+		printf("vmprotect section failed\n");
+		return 1;
+	  }
 	}
-
 	struct ctx dummy;
 	struct ctx new;
 	ctx_make(&new, exectramp, (char*)copyargv, STANDARD);
@@ -560,36 +625,40 @@ static void forktramp(void* arg) {
 }
 
 static void copyrange(struct vmctx *vm, unsigned from, unsigned to) {
-        for (unsigned i = from; i < to; ++i) {
-		vm->map[i] = bitmap_alloc(bitmap_pages, sizeof(bitmap_pages));
-		if (vm->map[i] == -1) {
-			abort();
-		}
-                if (-1 == pwrite(memfd,
-                                USER_START + i * PAGE_SIZE,
-                                PAGE_SIZE,
-				vm->map[i] * PAGE_SIZE)) {
-                        perror("pwrite");
-                        abort();
-                }
-        }
+	for (unsigned i = from; i < to; ++i) {
+	  vm->map[i] = bitmap_alloc(sh_mem->bitmap_pages, sizeof(sh_mem->bitmap_pages));
+	  if (vm->map[i] == -1) {
+		abort();
+	  }
+	  if (-1 == pwrite(sh_mem->memfd,
+					   USER_START + i * PAGE_SIZE,
+					   PAGE_SIZE,
+					   vm->map[i] * PAGE_SIZE)) {
+		perror("pwrite");
+		abort();
+	  }
+	}
 }
 
 static void vmctx_copy(struct vmctx *dst, struct vmctx *src) {
-        dst->brk = src->brk;
-        dst->stack = src->stack;
-        copyrange(dst, 0, src->brk);
-        copyrange(dst, src->stack, USER_PAGES - 1);
+	dst->brk = src->brk;
+	dst->stack = src->stack;
+	copyrange(dst, 0, src->brk);
+	copyrange(dst, src->stack, USER_PAGES - 1);
 }
 
 static int do_fork(unsigned long sp) {
-	struct task *t = sched_new(forktramp, (void *) sp, 0, NONE);
+	acquire(&sh_mem->task_lock);
+	struct task *t = sched_new(forktramp, (void*)sp, 0, STANDARD);
+	release(&sh_mem->task_lock);
 	vmctx_copy(&t->vm, &current->vm);
 	for (int i = 0; i < FD_MAX; ++i) {
-		set_fd(t, i, current->fd[i]);
+	  set_fd(t, i, current->fd[i]);
 	}
+	acquire(&sh_mem->task_lock);
 	policy_run(t);
-	return t - taskarray + 1;
+	release(&sh_mem->task_lock);
+	return t - sh_mem->tasks + 1;
 }
 
 int sys_exit(int code) {
@@ -717,23 +786,23 @@ static int pipe_write(int fd, const void *buf, unsigned sz) {
 }
 
 static int pipe_close(int fd) {
-	struct file *f = current->fd[fd];
+  	struct file *f = current->fd[fd];
 
 	bool read;
 	struct pipe *p = fd2pipe(fd, &read);
 	if (read) {
-		p->rdclose = 1;
+	  p->rdclose = 1;
 	} else {
-		p->wrclose = 1;
+	  p->wrclose = 1;
 	}
 
 	struct task *t;
 	while ((t = pop_task(&p->q))) {
-		policy_run(t);
+	  policy_run(t);
 	}
 
 	if (p->rdclose && p->wrclose) {
-		pool_free(&pipepool, p);
+	  pool_free(&sh_mem->pipe_pool, p);
 	}
 }
 
@@ -752,7 +821,7 @@ static void init_file(struct file *f, const struct fileops *ops) {
 }
 
 int sys_pipe(int *pipe) {
-	struct pipe *p = pool_alloc(&pipepool);
+	struct pipe *p = pool_alloc(&sh_mem->pipe_pool);
 	if (!p) {
 		goto err;
 	}
@@ -780,7 +849,7 @@ int sys_pipe(int *pipe) {
 	return 0;
 
 err_clean:
-	pool_free(&pipepool, p);
+	pool_free(&sh_mem->pipe_pool, p);
 err:
 	return -1;
 }
@@ -800,39 +869,47 @@ int main(int argc, char *argv[]) {
 	};
 	sigemptyset(&act.sa_mask);
 
-	if (-1 == sigaction(SIGSEGV, &act, NULL)) {
-		perror("signal set failed");
-		return 1;
+	sh_mem = mmap(NULL, sizeof(struct shared_memory), PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+	sh_mem->time = 0;
+	sh_mem->task_pool = (struct pool)POOL_INITIALIZER_ARRAY(sh_mem->tasks);
+	sh_mem->pipe_pool = (struct pool)POOL_INITIALIZER_ARRAY(sh_mem->pipes);
+	sh_mem->task_lock = 0;
+	sh_mem->runq = NULL;
+	sh_mem->waitq = NULL;
+
+	if (sigaction(SIGSEGV, &act, NULL) == -1) {
+	  perror("signal set failed");
+	  return 1;
 	}
 
-	memfd = memfd_create("mem", 0);
-	if (memfd < 0) {
-		perror("memfd_create");
-		return 1;
+	sh_mem->memfd = memfd_create("mem", 0);
+	if (sh_mem->memfd < 0) {
+	  perror("memfd_create");
+	  return 1;
 	}
 
-	if (ftruncate(memfd, PAGE_SIZE * MEM_PAGES) < 0) {
-		perror("ftrucate");
-		return 1;
+	if (ftruncate(sh_mem->memfd, PAGE_SIZE * MEM_PAGES) < 0) {
+	  perror("ftrucate");
+	  return 1;
 	}
 
 	struct stat st;
 	if (stat("rootfs.cpio", &st)) {
-		perror("stat rootfs");
-		return 1;
+	  perror("stat rootfs");
+	  return 1;
 	}
 
 	int fd = open("rootfs.cpio", O_RDONLY);
 	if (fd < 0) {
-		perror("open rootfs");
-		return 1;
+	  perror("open rootfs");
+	  return 1;
 	}
 
-	rootfs_sz = st.st_size;
-	rootfs = mmap(NULL, rootfs_sz, PROT_READ, MAP_PRIVATE, fd, 0);
-	if (rootfs == MAP_FAILED) {
-		perror("mmap rootfs");
-		return 1;
+	sh_mem->rootfs_sz = st.st_size;
+	sh_mem->rootfs = mmap(NULL, sh_mem->rootfs_sz, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (sh_mem->rootfs == MAP_FAILED) {
+	  perror("mmap rootfs");
+	  return 1;
 	}
 
 	policy_cmp = prio_cmp;
@@ -851,4 +928,4 @@ int main(int argc, char *argv[]) {
 
 	policy_run(t);
 	sched_run();
-}
+  }
